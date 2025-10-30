@@ -1,6 +1,9 @@
 const { program } = require('commander');
-const fs = require('fs/promises'); // Використовуємо асинхронний модуль
+const fs = require('fs/promises');
 const http = require('http');
+const path = require('path');
+const url = require('url');
+const superagent = require('superagent');
 
 // Налаштування програми та обов'язкових параметрів
 program
@@ -20,20 +23,114 @@ async function startServer() {
     console.log(`Директорію для кешу створено або вона вже існує: ${options.cache}`);
 
     // Створення та запуск веб-сервера
-    const server = http.createServer((req, res) => {
-      // Наразі сервер відповідає простим "Hello, World!"
-      res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end('Hello, World!');
+    const server = http.createServer(async (req, res) => {
+      const parsedUrl = url.parse(req.url, true);
+      const pathname = parsedUrl.pathname;
+      const statusCode = pathname.substring(1); // Отримуємо код (наприклад, '200')
+      
+      // Перевірка наявності коду стану
+      if (!statusCode) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Bad Request: HTTP status code is missing in the URL path.');
+        return;
+      }
+      
+      const cachePath = path.join(options.cache, `${statusCode}.jpeg`);
+      
+      // Логіка обробки HTTP-методів
+      switch (req.method) {
+        case 'GET':
+          try {
+            // 1. Спроба прочитати файл з кешу
+            const fileContent = await fs.readFile(cachePath);
+            res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+            res.end(fileContent);
+          } catch (error) {
+            // 2. Якщо файл не знайдено, запитуємо на http.cat
+            if (error.code === 'ENOENT') {
+              try {
+                // Перевірка валідності коду стану
+                const statusNum = parseInt(statusCode);
+                if (isNaN(statusNum) || statusNum < 100 || statusNum > 599) {
+                  res.writeHead(400, { 'Content-Type': 'text/plain' });
+                  res.end('Bad Request: Invalid HTTP status code.');
+                  return;
+                }
+
+                // Виконання запиту до http.cat
+                const response = await superagent.get(`http.cat/${statusNum}`);
+                const imageData = response.body;
+
+                // Збереження отриманого зображення в кеш
+                await fs.writeFile(cachePath, imageData);
+
+                // Надсилання зображення клієнту
+                res.writeHead(200, { 'Content-Type': response.headers['content-type'] });
+                res.end(imageData);
+              } catch (superagentErr) {
+                console.error('Помилка при запиті до http.cat:', superagentErr.message);
+                res.writeHead(500, { 'Content-Type': 'text/plain' });
+                res.end('Internal Server Error: Failed to fetch image from http.cat.');
+              }
+            } else {
+              // Обробка інших помилок файлової системи
+              console.error('Помилка при читанні з кешу:', error.message);
+              res.writeHead(500, { 'Content-Type': 'text/plain' });
+              res.end('Internal Server Error: Failed to read from cache.');
+            }
+          }
+          break;
+
+        case 'PUT':
+          let body = [];
+          req.on('data', (chunk) => {
+            body.push(chunk);
+          }).on('end', async () => {
+            try {
+              const fileContent = Buffer.concat(body);
+              await fs.writeFile(cachePath, fileContent);
+              res.writeHead(201, { 'Content-Type': 'text/plain' });
+              res.end('Created');
+            } catch (error) {
+              console.error('Помилка при записі в кеш:', error.message);
+              res.writeHead(500, { 'Content-Type': 'text/plain' });
+              res.end('Internal Server Error');
+            }
+          });
+          break;
+
+        case 'DELETE':
+          try {
+            await fs.unlink(cachePath);
+            res.writeHead(200, { 'Content-Type': 'text/plain' });
+            res.end('OK');
+          } catch (error) {
+            if (error.code === 'ENOENT') {
+              res.writeHead(404, { 'Content-Type': 'text/plain' });
+              res.end('Not Found');
+            } else {
+              console.error('Помилка при видаленні з кешу:', error.message);
+              res.writeHead(500, { 'Content-Type': 'text/plain' });
+              res.end('Internal Server Error');
+            }
+          }
+          break;
+
+        default:
+          res.writeHead(405, { 'Content-Type': 'text/plain' });
+          res.end('Method not allowed');
+          break;
+      }
     });
 
     // Обробка помилок при запуску сервера (наприклад, зайнятий порт)
     server.on('error', (err) => {
       if (err.code === 'EADDRINUSE') {
-        console.error(`Помилка: Порт ${options.port} на адресі ${options.host} вже використовується.`);
+        console.error(`Помилка: Порт ${options.port} вже використовується.`);
       } else {
         console.error('Сталася помилка:', err);
       }
-      process.exit(1); // Завершення програми з кодом помилки
+      process.exit(1);
     });
 
     server.listen(options.port, options.host, () => {
@@ -46,5 +143,5 @@ async function startServer() {
   }
 }
 
-// Виклик функції для запуску сервера
+// Запуск головної функції
 startServer();
